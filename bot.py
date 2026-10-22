@@ -7,8 +7,11 @@ Run with:  python bot.py
 from __future__ import annotations
 
 import logging
+import os
 import re
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from telegram import (
@@ -19,7 +22,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import TelegramError
+from telegram.error import Forbidden, TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -124,6 +127,9 @@ async def send_promo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 reply_markup=keyboard,
                 disable_web_page_preview=True,
             )
+    except Forbidden:
+        # User blocked the bot; nothing we can send them.
+        log.info("Chat %s blocked the bot; skipping.", chat.id)
     except TelegramError as exc:
         log.warning("Banner send failed (%s); falling back to text.", exc)
         _banner_file_id = None
@@ -218,7 +224,35 @@ async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if isinstance(context.error, Forbidden):
+        log.info("Bot blocked by user: %s", context.error)
+        return
     log.error("Handler error", exc_info=context.error)
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def do_HEAD(self) -> None:
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, *args) -> None:
+        pass
+
+
+def start_health_server() -> None:
+    """Bind $PORT so hosts like Render's Web Service see an open port."""
+    port = os.getenv("PORT")
+    if not port:
+        return
+    server = HTTPServer(("0.0.0.0", int(port)), _HealthHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log.info("Health server listening on :%s", port)
 
 
 async def post_init(application: Application) -> None:
@@ -249,6 +283,8 @@ def main() -> None:
     )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback))
     application.add_error_handler(on_error)
+
+    start_health_server()
 
     log.info("Polling for updates… (Ctrl-C to stop)")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
